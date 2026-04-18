@@ -77,6 +77,7 @@ if __name__ == '__main__':
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64
+import math
 
 class MotorNode(Node):
     def __init__(self):
@@ -85,28 +86,52 @@ class MotorNode(Node):
         self.theta_pub = self.create_publisher(Float64, '/plant_state', 10)
 
         self.u = 0.0
-        self.theta = 0.0 # Posición [rad]
-        self.omega = 0.0 # Velocidad [rad/s]
+        self.theta = 0.0 # Posición x1 [rad]
+        self.omega = 0.0 # Velocidad x2 [rad/s]
 
-        # Parámetros físicos del Maxon 148867 (Slide 4)
-        self.R = 0.117 # Terminal resistance [Ohm]
-        self.J = 1.34e-5 # Rotor inertia [kg*m^2]
-        self.kt = 0.0164 # Torque constant [Nm/A]
-        self.ke = 0.0301 # Speed constant (convertida a Vs/rad)
+        # Parámetros físicos del Maxon 148867
+        self.R = 0.316
+        self.J = 1.34e-5
+        self.kt = 0.0302
+        self.ke = 0.0302
 
-        self.dt = 0.01 # Integración a 100 Hz
+        self.dt = 0.01 # Tiempo de muestreo de la simulación
+
+        # ----- Discretización Exacta (Zero-Order Hold) -----
+        # Ecuación diferencial: omega_dot = -a * omega + b * u
+        self.a = (self.kt * self.ke) / (self.R * self.J)
+        self.b = self.kt / (self.R * self.J)
+
+        # Cálculo de las matrices discretas Ad y Bd evaluadas analíticamente
+        exp_adt = math.exp(-self.a * self.dt)
+        
+        # Matriz Ad = [1, (1 - exp(-a*dt))/a ; 0, exp(-a*dt)]
+        self.Ad_11 = 1.0
+        self.Ad_12 = (1.0 - exp_adt) / self.a
+        self.Ad_21 = 0.0
+        self.Ad_22 = exp_adt
+
+        # Matriz Bd = [(b/a) * (dt - (1 - exp(-a*dt))/a) ; (b/a) * (1 - exp(-a*dt))]
+        self.Bd_1 = (self.b / self.a) * (self.dt - self.Ad_12)
+        self.Bd_2 = (self.b / self.a) * (1.0 - exp_adt)
+        # ---------------------------------------------------
+
         self.timer = self.create_timer(self.dt, self.update_plant)
 
     def u_callback(self, msg):
         self.u = msg.data
 
     def update_plant(self):
-        # Ecuaciones de estado para motor DC (ignorando inductancia L por ser muy pequeña)
-        omega_dot = -(self.kt * self.ke) / (self.R * self.J) * self.omega + (self.kt) / (self.R * self.J) * self.u
-        
-        self.omega += omega_dot * self.dt
-        self.theta += self.omega * self.dt
+        # Aplicamos la ecuación en diferencias de espacio de estados
+        # x[k+1] = Ad * x[k] + Bd * u[k]
+        theta_next = self.Ad_11 * self.theta + self.Ad_12 * self.omega + self.Bd_1 * self.u
+        omega_next = self.Ad_21 * self.theta + self.Ad_22 * self.omega + self.Bd_2 * self.u
 
+        # Actualizamos los estados
+        self.theta = theta_next
+        self.omega = omega_next
+
+        # Publicamos la posición
         msg = Float64()
         msg.data = self.theta
         self.theta_pub.publish(msg)
