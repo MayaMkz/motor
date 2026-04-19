@@ -82,59 +82,47 @@ import math
 class MotorNode(Node):
     def __init__(self):
         super().__init__('motor_node')
-        self.u_sub = self.create_subscription(Float64, '/control_u', self.u_callback, 10)
-        self.theta_pub = self.create_publisher(Float64, '/plant_state', 10)
+        self.u1_sub = self.create_subscription(Float64, '/control_u1', self.u1_callback, 10)
+        self.u2_sub = self.create_subscription(Float64, '/control_u2', self.u2_callback, 10)
+        
+        self.theta1_pub = self.create_publisher(Float64, '/plant_state1', 10)
+        self.theta2_pub = self.create_publisher(Float64, '/plant_state2', 10)
 
-        self.u = 0.0
-        self.theta = 0.0 # Posición x1 [rad]
-        self.omega = 0.0 # Velocidad x2 [rad/s]
+        self.u1 = 0.0; self.theta1 = 0.0; self.omega1 = 0.0
+        self.u2 = 0.0; self.theta2 = 0.0; self.omega2 = 0.0
 
-        # Parámetros físicos del Maxon 148867
-        self.R = 0.316
-        self.J = 1.34e-5
-        self.kt = 0.0302
-        self.ke = 0.0302
+        self.R = 0.316; self.J = 1.34e-5; self.kt = 0.0302; self.ke = 0.0302
+        self.dt = 0.01
 
-        self.dt = 0.01 # Tiempo de muestreo de la simulación
-
-        # ----- Discretización Exacta (Zero-Order Hold) -----
-        # Ecuación diferencial: omega_dot = -a * omega + b * u
         self.a = (self.kt * self.ke) / (self.R * self.J)
         self.b = self.kt / (self.R * self.J)
-
-        # Cálculo de las matrices discretas Ad y Bd evaluadas analíticamente
         exp_adt = math.exp(-self.a * self.dt)
         
-        # Matriz Ad = [1, (1 - exp(-a*dt))/a ; 0, exp(-a*dt)]
-        self.Ad_11 = 1.0
-        self.Ad_12 = (1.0 - exp_adt) / self.a
-        self.Ad_21 = 0.0
-        self.Ad_22 = exp_adt
-
-        # Matriz Bd = [(b/a) * (dt - (1 - exp(-a*dt))/a) ; (b/a) * (1 - exp(-a*dt))]
+        self.Ad_11 = 1.0; self.Ad_12 = (1.0 - exp_adt) / self.a
+        self.Ad_21 = 0.0; self.Ad_22 = exp_adt
         self.Bd_1 = (self.b / self.a) * (self.dt - self.Ad_12)
         self.Bd_2 = (self.b / self.a) * (1.0 - exp_adt)
-        # ---------------------------------------------------
 
         self.timer = self.create_timer(self.dt, self.update_plant)
 
-    def u_callback(self, msg):
-        self.u = msg.data
+    def u1_callback(self, msg): self.u1 = msg.data
+    def u2_callback(self, msg): self.u2 = msg.data
 
     def update_plant(self):
-        # Aplicamos la ecuación en diferencias de espacio de estados
-        # x[k+1] = Ad * x[k] + Bd * u[k]
-        theta_next = self.Ad_11 * self.theta + self.Ad_12 * self.omega + self.Bd_1 * self.u
-        omega_next = self.Ad_21 * self.theta + self.Ad_22 * self.omega + self.Bd_2 * self.u
+        # Sistema 1
+        theta1_next = self.Ad_11 * self.theta1 + self.Ad_12 * self.omega1 + self.Bd_1 * self.u1
+        omega1_next = self.Ad_21 * self.theta1 + self.Ad_22 * self.omega1 + self.Bd_2 * self.u1
+        self.theta1 = theta1_next; self.omega1 = omega1_next
+        
+        # Sistema 2
+        theta2_next = self.Ad_11 * self.theta2 + self.Ad_12 * self.omega2 + self.Bd_1 * self.u2
+        omega2_next = self.Ad_21 * self.theta2 + self.Ad_22 * self.omega2 + self.Bd_2 * self.u2
+        self.theta2 = theta2_next; self.omega2 = omega2_next
 
-        # Actualizamos los estados
-        self.theta = theta_next
-        self.omega = omega_next
-
-        # Publicamos la posición
-        msg = Float64()
-        msg.data = self.theta
-        self.theta_pub.publish(msg)
+        msg1 = Float64(); msg1.data = self.theta1
+        msg2 = Float64(); msg2.data = self.theta2
+        self.theta1_pub.publish(msg1)
+        self.theta2_pub.publish(msg2)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -157,20 +145,26 @@ import random
 class SensorNode(Node):
     def __init__(self):
         super().__init__('sensor_node')
-        self.x_sub = self.create_subscription(Float64, '/plant_state', self.state_callback, 10)
-        self.y_pub = self.create_publisher(Float64, '/measured_y', 10)
+        self.x1_sub = self.create_subscription(Float64, '/plant_state1', self.state1_callback, 10)
+        self.x2_sub = self.create_subscription(Float64, '/plant_state2', self.state2_callback, 10)
         
-        # Desviación estándar definida en el PDF
-        self.sigma = 0.05 
+        self.y1_pub = self.create_publisher(Float64, '/measured_y1', 10)
+        self.y2_pub = self.create_publisher(Float64, '/measured_y2', 10)
+        
+        # AJUSTA ESTO PARA EL CASO 2 (Ruido vs Sin Ruido): 
+        # Sistema 1 con ruido, Sistema 2 limpio (sigma2 = 0.0)
+        self.sigma1 = 0.05 
+        self.sigma2 = 0.05 
 
-    def state_callback(self, msg):
-        y_true = msg.data
-        noise = random.gauss(0, self.sigma)
-        y_m = y_true + noise # Salida con ruido
+    def state1_callback(self, msg):
+        y_m = msg.data + random.gauss(0, self.sigma1)
+        out = Float64(); out.data = y_m
+        self.y1_pub.publish(out)
 
-        out = Float64()
-        out.data = y_m
-        self.y_pub.publish(out)
+    def state2_callback(self, msg):
+        y_m = msg.data + random.gauss(0, self.sigma2)
+        out = Float64(); out.data = y_m
+        self.y2_pub.publish(out)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -193,43 +187,61 @@ class ControllerNode(Node):
     def __init__(self):
         super().__init__('controller_node')
         self.ref_sub = self.create_subscription(Float64, '/reference', self.ref_callback, 10)
-        self.y_sub = self.create_subscription(Float64, '/measured_y', self.y_callback, 10)
-        self.u_pub = self.create_publisher(Float64, '/control_u', 10)
+        self.y1_sub = self.create_subscription(Float64, '/measured_y1', self.y1_callback, 10)
+        self.y2_sub = self.create_subscription(Float64, '/measured_y2', self.y2_callback, 10)
+        
+        self.u1_pub = self.create_publisher(Float64, '/control_u1', 10)
+        self.u2_pub = self.create_publisher(Float64, '/control_u2', 10)
 
         self.r = 0.0
-        self.y = 0.0
-
-        # GANANCIAS PI (Cámbialas aquí para tus análisis)
-        self.kp = 15.0
-        self.ki = 5.0
-
-        self.integral_e = 0.0
+        self.y1 = 0.0; self.y2 = 0.0
+        self.integral_e1 = 0.0; self.integral_e2 = 0.0
         self.dt = 0.05
+
+        # ==========================================
+        # CONFIGURACIÓN DEL SISTEMA 1 (Color Verde)
+        # ==========================================
+        self.kp1 = 0.17
+        self.ki1 = 0.30
+        self.sat1_enabled = True
+
+        # ==========================================
+        # CONFIGURACIÓN DEL SISTEMA 2 (Color Morado)
+        # ==========================================
+        self.kp2 = 0.13
+        self.ki2 = 0.55
+        self.sat2_enabled = True
+
         self.timer = self.create_timer(self.dt, self.control_loop)
 
-    def ref_callback(self, msg):
-        self.r = msg.data
+    def ref_callback(self, msg): self.r = msg.data
+    def y1_callback(self, msg): self.y1 = msg.data
+    def y2_callback(self, msg): self.y2 = msg.data
 
-    def y_callback(self, msg):
-        self.y = msg.data
+    def calculate_pi(self, e, integral_e, kp, ki, sat_enabled):
+        integral_e += e * self.dt
+        u = kp * e + ki * integral_e
+        
+        if sat_enabled:
+            if u > 24.0:
+                u = 24.0
+                integral_e -= e * self.dt # Anti-windup
+            elif u < -24.0:
+                u = -24.0
+                integral_e -= e * self.dt # Anti-windup
+        return u, integral_e
 
     def control_loop(self):
-        e = self.r - self.y
-        self.integral_e += e * self.dt
-        
-        u = self.kp * e + self.ki * self.integral_e
+        e1 = self.r - self.y1
+        e2 = self.r - self.y2
 
-        # Saturación de Voltaje y Anti-windup
-        if u > 24.0:
-            u = 24.0
-            self.integral_e -= e * self.dt # Anti-windup
-        elif u < -24.0:
-            u = -24.0
-            self.integral_e -= e * self.dt # Anti-windup
+        u1, self.integral_e1 = self.calculate_pi(e1, self.integral_e1, self.kp1, self.ki1, self.sat1_enabled)
+        u2, self.integral_e2 = self.calculate_pi(e2, self.integral_e2, self.kp2, self.ki2, self.sat2_enabled)
 
-        msg = Float64()
-        msg.data = u
-        self.u_pub.publish(msg)
+        msg1 = Float64(); msg1.data = u1
+        msg2 = Float64(); msg2.data = u2
+        self.u1_pub.publish(msg1)
+        self.u2_pub.publish(msg2)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -254,58 +266,62 @@ class PlotterNode(Node):
     def __init__(self):
         super().__init__('plotter_node')
         self.ref_sub = self.create_subscription(Float64, '/reference', self.ref_callback, 10)
-        self.y_sub = self.create_subscription(Float64, '/measured_y', self.y_callback, 10)
-        self.u_sub = self.create_subscription(Float64, '/control_u', self.u_callback, 10)
+        self.y1_sub = self.create_subscription(Float64, '/measured_y1', self.y1_callback, 10)
+        self.y2_sub = self.create_subscription(Float64, '/measured_y2', self.y2_callback, 10)
+        self.u1_sub = self.create_subscription(Float64, '/control_u1', self.u1_callback, 10)
+        self.u2_sub = self.create_subscription(Float64, '/control_u2', self.u2_callback, 10)
 
         self.ref = 0.0
-        self.y = 0.0
-        self.u = 0.0
-        self.t = 0.0
-        self.dt = 0.05
+        self.y1 = 0.0; self.y2 = 0.0
+        self.u1 = 0.0; self.u2 = 0.0
+        self.t = 0.0; self.dt = 0.05
 
-        self.time_data = deque(maxlen=400)
-        self.ref_data = deque(maxlen=400)
-        self.y_data = deque(maxlen=400)
-        self.e_data = deque(maxlen=400)
-        self.u_data = deque(maxlen=400)
+        self.time_data = deque(maxlen=400); self.ref_data = deque(maxlen=400)
+        self.y1_data = deque(maxlen=400); self.y2_data = deque(maxlen=400)
+        self.e1_data = deque(maxlen=400); self.e2_data = deque(maxlen=400)
+        self.u1_data = deque(maxlen=400); self.u2_data = deque(maxlen=400)
 
         plt.ion()
-        # Crea dos subplots como pide el PDF
         self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 8))
         self.fig.tight_layout(pad=4.0)
         self.timer = self.create_timer(self.dt, self.update_plot)
 
     def ref_callback(self, msg): self.ref = msg.data
-    def y_callback(self, msg): self.y = msg.data
-    def u_callback(self, msg): self.u = msg.data
+    def y1_callback(self, msg): self.y1 = msg.data
+    def y2_callback(self, msg): self.y2 = msg.data
+    def u1_callback(self, msg): self.u1 = msg.data
+    def u2_callback(self, msg): self.u2 = msg.data
 
     def update_plot(self):
         self.t += self.dt
-        e = self.ref - self.y
+        e1 = self.ref - self.y1
+        e2 = self.ref - self.y2
 
-        self.time_data.append(self.t)
-        self.ref_data.append(self.ref)
-        self.y_data.append(self.y)
-        self.e_data.append(e)
-        self.u_data.append(self.u)
+        self.time_data.append(self.t); self.ref_data.append(self.ref)
+        self.y1_data.append(self.y1); self.y2_data.append(self.y2)
+        self.e1_data.append(e1); self.e2_data.append(e2)
+        self.u1_data.append(self.u1); self.u2_data.append(self.u2)
 
         self.ax1.clear()
         self.ax1.plot(self.time_data, self.ref_data, 'b--', label='Reference r(t)')
-        self.ax1.plot(self.time_data, self.y_data, 'g-', label='Output ym(t)')
-        self.ax1.plot(self.time_data, self.e_data, 'r-', alpha=0.5, label='Error e(t)')
-        self.ax1.set_title('Plot 1: Tracking & Error Dynamics')
+        self.ax1.plot(self.time_data, self.y1_data, 'g-', label='Output y1 [Sys 1]')
+        self.ax1.plot(self.time_data, self.y2_data, 'm-', alpha=0.8, label='Output y2 [Sys 2]')
+        self.ax1.plot(self.time_data, self.e1_data, 'r:', alpha=0.5, label='Error e1')
+        self.ax1.plot(self.time_data, self.e2_data, 'c:', alpha=0.5, label='Error e2')
+        self.ax1.set_title('Plot 1: Tracking & Error Dynamics Comparison')
         self.ax1.set_ylabel('Position / Error (rad)')
-        self.ax1.legend()
+        self.ax1.legend(loc='upper right', fontsize='small')
         self.ax1.grid(True)
 
         self.ax2.clear()
-        self.ax2.plot(self.time_data, self.u_data, 'm-', label='Control Input u(t)')
-        self.ax2.axhline(24, color='r', linestyle=':', label='Saturation +24V')
-        self.ax2.axhline(-24, color='r', linestyle=':', label='Saturation -24V')
-        self.ax2.set_title('Plot 2: Control Effort')
+        self.ax2.plot(self.time_data, self.u1_data, 'g-', label='Control u1 [Sys 1]')
+        self.ax2.plot(self.time_data, self.u2_data, 'm-', alpha=0.8, label='Control u2 [Sys 2]')
+        self.ax2.axhline(24, color='r', linestyle=':', label='Sat +24V')
+        self.ax2.axhline(-24, color='r', linestyle=':', label='Sat -24V')
+        self.ax2.set_title('Plot 2: Control Effort Comparison')
         self.ax2.set_xlabel('Time [s]')
         self.ax2.set_ylabel('Voltage (V)')
-        self.ax2.legend()
+        self.ax2.legend(loc='upper right', fontsize='small')
         self.ax2.grid(True)
 
         plt.pause(0.001)
