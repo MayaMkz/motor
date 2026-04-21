@@ -1,384 +1,175 @@
-# motor
-¡Claro que sí! Vamos a armar este proyecto desde cero en su propia carpeta para que tengas todo súper limpio y listo para generar esos 6 plots que te piden. 
+¡Qué onda! Claro que sí. Me di a la tarea de extraer los códigos y arreglar un par de errorcitos de sintaxis que se generan al copiar directo del PDF (como símbolos faltantes por el formato del texto) para que te funcionen directo a la primera.
 
-Basándome en los requerimientos del PDF (motor Maxon 148867, controlador PI, saturación a $\pm24$ V, y ruido blanco con $\sigma=0.05$), aquí tienes la guía paso a paso, los comandos y todos los códigos adaptados a la física real de ese motor.
+[cite_start]Ojo: El documento en realidad tiene **3 archivos**[cite: 126, 203, 205]. [cite_start]El Jupyter Notebook necesita que exista la clase `NeuralNetwork` en un archivo separado para poder importarla[cite: 211]. 
 
----
+Aquí tienes los tres, listos para copiar y pegar:
 
-### Paso 1: Crear el Workspace y el Paquete
+### 1. Generador de Datos (`dataGeneration.py`)
+[cite_start]Este es el que simula el péndulo y te crea el archivo `dataPendulo.csv`[cite: 125, 126].
 
-Abre tu terminal y ejecuta los siguientes comandos para crear una carpeta exclusiva para este proyecto y generar el paquete de ROS 2:
+```python
+import numpy as np
+import pandas as pd
 
-```bash
-# 1. Crear el workspace
-mkdir -p ~/maxon_ws/src
-cd ~/maxon_ws/src
+tf = 60
+h = 0.001
+b = 0.05
+l = 1
+m = 1
+g = 9.81
 
-# 2. Crear el paquete de ROS 2
-ros2 pkg create --build-type ament_python maxon_control --dependencies rclpy std_msgs
+integral = 0
+prev_error = 0
 
-# 3. Entrar a la carpeta donde van los scripts
-cd maxon_control/maxon_control
+time = np.linspace(0, tf, int(tf/h))
+x1 = np.zeros_like(time)
+x2 = np.zeros_like(time)
+u = np.zeros_like(time)
+ref = np.zeros_like(time)
+k = 0
 
-# 4. Crear los archivos vacíos de los nodos
-touch manager_node.py motor_node.py sensor_node.py controller_node.py plotter_node.py
+def generateReferencePRBS():
+    minT = 0.1
+    maxT = 0.5
+    T = np.random.uniform(minT, maxT, size=int(tf/minT))
+    ref = np.zeros_like(time)
+    current_time = 0
+    for t in T:
+        ref[current_time:current_time+int(t/h)] = 2*np.random.rand() - 1
+        current_time += int(t/h)
+        if current_time >= len(time):
+            break
+    return ref
+
+def PID():
+    global integral, prev_error
+    Kp = 100
+    Ki = 0
+    Kd = 1
+    
+    error = ref[k] - x1[k]
+    integral = integral + error*h
+    derivative = (error - prev_error)/h
+    prev_error = error
+    return Kp*error + Ki*integral + Kd*derivative
+
+if __name__ == "__main__":
+    x1[0] = 0.1
+    x2[0] = 0
+    ref = generateReferencePRBS()
+    
+    for k in range(0, len(time)-1):
+        u[k] = PID()
+        x1[k+1] = x1[k] + h*x2[k]
+        x2[k+1] = x2[k] + h*(m*g*l*np.sin(x1[k]) - b*x2[k] + u[k])/m
+        
+    pd.DataFrame({'time': time, 'x1': x1, 'x2': x2, 
+                  'u': u, 'ref': ref}).to_csv('dataPendulo.csv', index=False)
 ```
 
----
+### 2. Clase de la Red Neuronal (`NeuralNetwork.py`)
+Tienes que guardar este código en el mismo directorio con el nombre `NeuralNetwork.py`. [cite_start]El Jupyter Notebook lo va a mandar llamar[cite: 203, 211].
 
-### Paso 2: Código de los Nodos
-
-Copia y pega el siguiente código en cada uno de los archivos correspondientes.
-
-#### 1. `manager_node.py` (Genera la referencia cada 3 segundos)
 ```python
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float64
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 
-class ManagerNode(Node):
-    def __init__(self):
-        super().__init__('manager_node')
-        self.ref_pub = self.create_publisher(Float64, '/reference', 10)
+class NeuralNetwork(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size):
+        super(NeuralNetwork, self).__init__()
+        self.lin1 = nn.Linear(input_size, hidden_size)
+        self.lin2 = nn.Linear(hidden_size, hidden_size)
+        self.lin3 = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x):
+        x = torch.sigmoid(self.lin1(x))
+        x = torch.tanh(self.lin2(x))
+        x = self.lin3(x)
+        return x
+
+    def fit(self, x_train, y_train, epochs=1000, batch_size=100, learning_rate=0.001):
+        dataset = TensorDataset(x_train, y_train)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
         
-        # Cambia la referencia cada 3 segundos
-        self.timer = self.create_timer(3.0, self.update_reference)
-        
-        # Publica la referencia actual a alta velocidad
-        self.pub_timer = self.create_timer(0.05, self.publish_ref)
-
-        self.references = [0.0, 1.0, 2.0, -1.0, 0.5]
-        self.index = 0
-        self.current_ref = self.references[0]
-
-    def update_reference(self):
-        self.index = (self.index + 1) % len(self.references)
-        self.current_ref = self.references[self.index]
-        self.get_logger().info(f'Cambio de referencia: {self.current_ref:.2f} rad')
-
-    def publish_ref(self):
-        msg = Float64()
-        msg.data = self.current_ref
-        self.ref_pub.publish(msg)
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = ManagerNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
+        for epoch in range(epochs):
+            for x_batch, y_batch in loader:
+                optimizer.zero_grad()
+                outputs = self.forward(x_batch)
+                loss = criterion(outputs, y_batch)
+                loss.backward()
+                optimizer.step()
+            
+            # Quita el comentario de la siguiente línea si quieres ver cómo baja el error
+            # print(f'Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}')
 ```
 
-#### 2. `motor_node.py` (Modelo de 2do orden del Motor Maxon 148867)
+### 3. Notebook de Entrenamiento (`dinamicApproximation.ipynb`)
+[cite_start]Aquí te dejo el código dividido por las celdas que indica tu documento[cite: 205]. Cópialo bloque por bloque en tu Jupyter. 
+[cite_start]*(Nota: Ya le integré la corrección que sugiere el documento en el "Cell 2" para que PyTorch no te arroje alertas al cargar los datos [cite: 266, 267]).*
+
+[cite_start]**Celda 1:** [cite: 206]
 ```python
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float64
-import math
-
-class MotorNode(Node):
-    def __init__(self):
-        super().__init__('motor_node')
-        self.u1_sub = self.create_subscription(Float64, '/control_u1', self.u1_callback, 10)
-        self.u2_sub = self.create_subscription(Float64, '/control_u2', self.u2_callback, 10)
-        
-        self.theta1_pub = self.create_publisher(Float64, '/plant_state1', 10)
-        self.theta2_pub = self.create_publisher(Float64, '/plant_state2', 10)
-
-        self.u1 = 0.0; self.theta1 = 0.0; self.omega1 = 0.0
-        self.u2 = 0.0; self.theta2 = 0.0; self.omega2 = 0.0
-
-        self.R = 0.316; self.J = 1.34e-5; self.kt = 0.0302; self.ke = 0.0302
-        self.dt = 0.01
-
-        self.a = (self.kt * self.ke) / (self.R * self.J)
-        self.b = self.kt / (self.R * self.J)
-        exp_adt = math.exp(-self.a * self.dt)
-        
-        self.Ad_11 = 1.0; self.Ad_12 = (1.0 - exp_adt) / self.a
-        self.Ad_21 = 0.0; self.Ad_22 = exp_adt
-        self.Bd_1 = (self.b / self.a) * (self.dt - self.Ad_12)
-        self.Bd_2 = (self.b / self.a) * (1.0 - exp_adt)
-
-        self.timer = self.create_timer(self.dt, self.update_plant)
-
-    def u1_callback(self, msg): self.u1 = msg.data
-    def u2_callback(self, msg): self.u2 = msg.data
-
-    def update_plant(self):
-        # Sistema 1
-        theta1_next = self.Ad_11 * self.theta1 + self.Ad_12 * self.omega1 + self.Bd_1 * self.u1
-        omega1_next = self.Ad_21 * self.theta1 + self.Ad_22 * self.omega1 + self.Bd_2 * self.u1
-        self.theta1 = theta1_next; self.omega1 = omega1_next
-        
-        # Sistema 2
-        theta2_next = self.Ad_11 * self.theta2 + self.Ad_12 * self.omega2 + self.Bd_1 * self.u2
-        omega2_next = self.Ad_21 * self.theta2 + self.Ad_22 * self.omega2 + self.Bd_2 * self.u2
-        self.theta2 = theta2_next; self.omega2 = omega2_next
-
-        msg1 = Float64(); msg1.data = self.theta1
-        msg2 = Float64(); msg2.data = self.theta2
-        self.theta1_pub.publish(msg1)
-        self.theta2_pub.publish(msg2)
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = MotorNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
-```
-
-#### 3. `sensor_node.py` (Añade el ruido blanco gaussiano)
-```python
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float64
-import random
-
-class SensorNode(Node):
-    def __init__(self):
-        super().__init__('sensor_node')
-        self.x1_sub = self.create_subscription(Float64, '/plant_state1', self.state1_callback, 10)
-        self.x2_sub = self.create_subscription(Float64, '/plant_state2', self.state2_callback, 10)
-        
-        self.y1_pub = self.create_publisher(Float64, '/measured_y1', 10)
-        self.y2_pub = self.create_publisher(Float64, '/measured_y2', 10)
-        
-        # AJUSTA ESTO PARA EL CASO 2 (Ruido vs Sin Ruido): 
-        # Sistema 1 con ruido, Sistema 2 limpio (sigma2 = 0.0)
-        self.sigma1 = 0.05 
-        self.sigma2 = 0.05 
-
-    def state1_callback(self, msg):
-        y_m = msg.data + random.gauss(0, self.sigma1)
-        out = Float64(); out.data = y_m
-        self.y1_pub.publish(out)
-
-    def state2_callback(self, msg):
-        y_m = msg.data + random.gauss(0, self.sigma2)
-        out = Float64(); out.data = y_m
-        self.y2_pub.publish(out)
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = SensorNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
-```
-
-#### 4. `controller_node.py` (PI con Saturación $\pm 24V$)
-```python
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float64
-
-class ControllerNode(Node):
-    def __init__(self):
-        super().__init__('controller_node')
-        self.ref_sub = self.create_subscription(Float64, '/reference', self.ref_callback, 10)
-        self.y1_sub = self.create_subscription(Float64, '/measured_y1', self.y1_callback, 10)
-        self.y2_sub = self.create_subscription(Float64, '/measured_y2', self.y2_callback, 10)
-        
-        self.u1_pub = self.create_publisher(Float64, '/control_u1', 10)
-        self.u2_pub = self.create_publisher(Float64, '/control_u2', 10)
-
-        self.r = 0.0
-        self.y1 = 0.0; self.y2 = 0.0
-        self.integral_e1 = 0.0; self.integral_e2 = 0.0
-        self.dt = 0.05
-
-        # ==========================================
-        # CONFIGURACIÓN DEL SISTEMA 1 (Color Verde)
-        # ==========================================
-        self.kp1 = 0.17
-        self.ki1 = 0.30
-        self.sat1_enabled = True
-
-        # ==========================================
-        # CONFIGURACIÓN DEL SISTEMA 2 (Color Morado)
-        # ==========================================
-        self.kp2 = 0.13
-        self.ki2 = 0.55
-        self.sat2_enabled = True
-
-        self.timer = self.create_timer(self.dt, self.control_loop)
-
-    def ref_callback(self, msg): self.r = msg.data
-    def y1_callback(self, msg): self.y1 = msg.data
-    def y2_callback(self, msg): self.y2 = msg.data
-
-    def calculate_pi(self, e, integral_e, kp, ki, sat_enabled):
-        integral_e += e * self.dt
-        u = kp * e + ki * integral_e
-        
-        if sat_enabled:
-            if u > 24.0:
-                u = 24.0
-                integral_e -= e * self.dt # Anti-windup
-            elif u < -24.0:
-                u = -24.0
-                integral_e -= e * self.dt # Anti-windup
-        return u, integral_e
-
-    def control_loop(self):
-        e1 = self.r - self.y1
-        e2 = self.r - self.y2
-
-        u1, self.integral_e1 = self.calculate_pi(e1, self.integral_e1, self.kp1, self.ki1, self.sat1_enabled)
-        u2, self.integral_e2 = self.calculate_pi(e2, self.integral_e2, self.kp2, self.ki2, self.sat2_enabled)
-
-        msg1 = Float64(); msg1.data = u1
-        msg2 = Float64(); msg2.data = u2
-        self.u1_pub.publish(msg1)
-        self.u2_pub.publish(msg2)
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = ControllerNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
-```
-
-#### 5. `plotter_node.py` (Formato estricto para el Slide 9)
-```python
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import Float64
+import torch
+import torch.nn as nn
+from NeuralNetwork import NeuralNetwork
+import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
-from collections import deque
 
-class PlotterNode(Node):
-    def __init__(self):
-        super().__init__('plotter_node')
-        self.ref_sub = self.create_subscription(Float64, '/reference', self.ref_callback, 10)
-        self.y1_sub = self.create_subscription(Float64, '/measured_y1', self.y1_callback, 10)
-        self.y2_sub = self.create_subscription(Float64, '/measured_y2', self.y2_callback, 10)
-        self.u1_sub = self.create_subscription(Float64, '/control_u1', self.u1_callback, 10)
-        self.u2_sub = self.create_subscription(Float64, '/control_u2', self.u2_callback, 10)
-
-        self.ref = 0.0
-        self.y1 = 0.0; self.y2 = 0.0
-        self.u1 = 0.0; self.u2 = 0.0
-        self.t = 0.0; self.dt = 0.05
-
-        self.time_data = deque(maxlen=400); self.ref_data = deque(maxlen=400)
-        self.y1_data = deque(maxlen=400); self.y2_data = deque(maxlen=400)
-        self.e1_data = deque(maxlen=400); self.e2_data = deque(maxlen=400)
-        self.u1_data = deque(maxlen=400); self.u2_data = deque(maxlen=400)
-
-        plt.ion()
-        self.fig, (self.ax1, self.ax2) = plt.subplots(2, 1, figsize=(10, 8))
-        self.fig.tight_layout(pad=4.0)
-        self.timer = self.create_timer(self.dt, self.update_plot)
-
-    def ref_callback(self, msg): self.ref = msg.data
-    def y1_callback(self, msg): self.y1 = msg.data
-    def y2_callback(self, msg): self.y2 = msg.data
-    def u1_callback(self, msg): self.u1 = msg.data
-    def u2_callback(self, msg): self.u2 = msg.data
-
-    def update_plot(self):
-        self.t += self.dt
-        e1 = self.ref - self.y1
-        e2 = self.ref - self.y2
-
-        self.time_data.append(self.t); self.ref_data.append(self.ref)
-        self.y1_data.append(self.y1); self.y2_data.append(self.y2)
-        self.e1_data.append(e1); self.e2_data.append(e2)
-        self.u1_data.append(self.u1); self.u2_data.append(self.u2)
-
-        self.ax1.clear()
-        self.ax1.plot(self.time_data, self.ref_data, 'b--', label='Reference r(t)')
-        self.ax1.plot(self.time_data, self.y1_data, 'g-', label='Output y1 [Sys 1]')
-        self.ax1.plot(self.time_data, self.y2_data, 'm-', alpha=0.8, label='Output y2 [Sys 2]')
-        self.ax1.plot(self.time_data, self.e1_data, 'r:', alpha=0.5, label='Error e1')
-        self.ax1.plot(self.time_data, self.e2_data, 'c:', alpha=0.5, label='Error e2')
-        self.ax1.set_title('Plot 1: Tracking & Error Dynamics Comparison')
-        self.ax1.set_ylabel('Position / Error (rad)')
-        self.ax1.legend(loc='upper right', fontsize='small')
-        self.ax1.grid(True)
-
-        self.ax2.clear()
-        self.ax2.plot(self.time_data, self.u1_data, 'g-', label='Control u1 [Sys 1]')
-        self.ax2.plot(self.time_data, self.u2_data, 'm-', alpha=0.8, label='Control u2 [Sys 2]')
-        self.ax2.axhline(24, color='r', linestyle=':', label='Sat +24V')
-        self.ax2.axhline(-24, color='r', linestyle=':', label='Sat -24V')
-        self.ax2.set_title('Plot 2: Control Effort Comparison')
-        self.ax2.set_xlabel('Time [s]')
-        self.ax2.set_ylabel('Voltage (V)')
-        self.ax2.legend(loc='upper right', fontsize='small')
-        self.ax2.grid(True)
-
-        plt.pause(0.001)
-
-def main(args=None):
-    rclpy.init(args=args)
-    node = PlotterNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
-
-if __name__ == '__main__':
-    main()
+model = NeuralNetwork(3, 10, 1)
+print(model)
 ```
 
----
-
-### Paso 3: Configurar el `setup.py`
-
-Regresa al directorio del paquete (`cd ~/maxon_ws/src/maxon_control`) y abre el archivo `setup.py`. Modifica la sección `entry_points` para que se vea exactamente así:
-
+[cite_start]**Celda 2:** [cite: 221]
 ```python
-    entry_points={
-        'console_scripts': [
-            'manager = maxon_control.manager_node:main',
-            'motor = maxon_control.motor_node:main',
-            'sensor = maxon_control.sensor_node:main',
-            'controller = maxon_control.controller_node:main',
-            'plotter = maxon_control.plotter_node:main',
-        ],
-    },
+dataSet = pd.read_csv('dataPendulo.csv')
+
+tD = pd.DataFrame()
+tD['uk'] = dataSet['u']
+tD['x2k'] = dataSet['x2']
+tD['x1k'] = dataSet['x1']
+tD['x1kp1'] = dataSet['x1'].shift(periods=-1)
+tD['t'] = dataSet['time']
+
+tD = tD.dropna()
+
+uk = tD['uk'].values
+x2k = tD['x2k'].values
+x1k = tD['x1k'].values
+x1kp1 = tD['x1kp1'].values
+t = tD['t'].values
+
+# Cargando tensores de forma optimizada
+x = torch.tensor(np.column_stack([uk, x2k, x1k]), dtype=torch.float32)
+y = torch.tensor(x1kp1.reshape(-1, 1), dtype=torch.float32)
 ```
 
----
-
-### Paso 4: Compilar y Ejecutar
-
-Abre tu terminal en la raíz del workspace (`cd ~/maxon_ws/`) y compila todo:
-
-```bash
-colcon build
-source install/setup.bash
+[cite_start]**Celda 3:** [cite: 272]
+```python
+n_epochs = 100
+batch_size = 1000
+model.fit(x, y, n_epochs, batch_size, 0.01)
 ```
 
-Para correr tu proyecto, necesitas abrir **5 pestañas** de terminal (asegúrate de correr `source install/setup.bash` en cada una) y lanzar los nodos:
+[cite_start]**Celda 4:** [cite: 280]
+```python
+predictions = model.forward(x)
 
-1. `ros2 run maxon_control manager`
-2. `ros2 run maxon_control motor`
-3. `ros2 run maxon_control sensor`
-4. `ros2 run maxon_control controller`
-5. `ros2 run maxon_control plotter`
+fig, ax = plt.subplots()
+ax.plot(t, x1kp1, label='Actual')
+ax.plot(t, predictions.detach().numpy(), label='Predicted')
 
----
+ax.set_xlabel('Time (s)')
+ax.set_ylabel('$x_1$ (rad)')
+ax.set_title('Actual vs Predicted $x_1$')
+ax.legend()
+ax.grid()
+ax.set_xlim(25, 30)
 
-### ¿Cómo hacer tu PDF para el Slide 8 y 9?
-Ya tienes las herramientas. Para generar los **6 plots** que pide el profesor, solo tienes que cambiar el código y volver a correr (no olvides compilar con `colcon build` si cambias algo):
+plt.show()
+```
 
-1. **Gain Comparison (2 Plots):** Ejecuta todo con una $K_p=5, K_i=1$ y tómale captura. Luego cambia el código de `controller_node.py` a $K_p=25, K_i=5$, compila, ejecuta y toma captura.
-2. **Noise Analysis (2 Plots):** Quédate con unas ganancias fijas. Toma captura normal. Luego ve a `sensor_node.py`, cambia `self.sigma = 0.0` (sin ruido), compila, ejecuta y toma la segunda captura.
-3. **Saturation Analysis (2 Plots):** En `controller_node.py`, comenta las líneas del `if u > 24.0:` (para quitar la saturación y dejar que el voltaje suba al infinito). Toma captura y compárala con tu captura del sistema saturado a $\pm24$.
+¡Guarda todo, corre primero el generador en tu terminal y luego pásate a VS Code a correr tu notebook!
